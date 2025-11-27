@@ -168,10 +168,7 @@ def batched_greedy_nmm(
         curr_indices = torch.where(category_ids == category_id)[0]
         curr_keep_to_merge_list = greedy_nmm(object_predictions_as_tensor[curr_indices], match_metric, match_threshold)
         curr_indices_list = curr_indices.tolist()
-        for curr_keep, curr_merge_list in curr_keep_to_merge_list.items():
-            keep = curr_indices_list[curr_keep]
-            merge_list = [curr_indices_list[curr_merge_ind] for curr_merge_ind in curr_merge_list]
-            keep_to_merge_list[keep] = merge_list
+        keep_to_merge_list.update(_remap_indices(curr_keep_to_merge_list, curr_indices_list))
     return keep_to_merge_list
 
 
@@ -286,6 +283,63 @@ def greedy_nmm(
     return keep_to_merge_list
 
 
+def _update_merge_mappings(
+    current_idx: int,
+    matched_box_indices: list[int],
+    keep_to_merge_list: dict[int, list[int]],
+    merge_to_keep: dict[int, int],
+):
+    """Helper function to update merge mapping dictionaries.
+
+    Args:
+        current_idx: Index of the current box being processed
+        matched_box_indices: List of indices that match with current box
+        keep_to_merge_list: Dictionary mapping keep indices to merge lists
+        merge_to_keep: Dictionary mapping merge indices to their keep index
+    """
+    if current_idx not in merge_to_keep:
+        keep_to_merge_list[current_idx] = []
+
+        for matched_box_idx in matched_box_indices:
+            matched_box_idx_native = int(matched_box_idx)
+            if matched_box_idx_native not in merge_to_keep:
+                keep_to_merge_list[current_idx].append(matched_box_idx_native)
+                merge_to_keep[matched_box_idx_native] = current_idx
+    else:
+        keep_idx = merge_to_keep[current_idx]
+        for matched_box_idx in matched_box_indices:
+            matched_box_idx_native = int(matched_box_idx)
+            if (
+                matched_box_idx_native not in keep_to_merge_list.get(keep_idx, [])
+                and matched_box_idx_native not in merge_to_keep
+            ):
+                if keep_idx not in keep_to_merge_list:
+                    keep_to_merge_list[keep_idx] = []
+                keep_to_merge_list[keep_idx].append(matched_box_idx_native)
+                merge_to_keep[matched_box_idx_native] = keep_idx
+
+
+def _remap_indices(
+    local_keep_to_merge_list: dict[int, list[int]],
+    global_indices: list[int],
+) -> dict[int, list[int]]:
+    """Helper function to remap local indices to global indices.
+
+    Args:
+        local_keep_to_merge_list: Dictionary with local indices (within category)
+        global_indices: List mapping local indices to global indices
+
+    Returns:
+        Dictionary with remapped global indices
+    """
+    global_keep_to_merge_list = {}
+    for local_keep, local_merge_list in local_keep_to_merge_list.items():
+        global_keep = global_indices[local_keep]
+        global_merge_list = [global_indices[local_merge_idx] for local_merge_idx in local_merge_list]
+        global_keep_to_merge_list[global_keep] = global_merge_list
+    return global_keep_to_merge_list
+
+
 def batched_nmm(
     object_predictions_as_tensor: torch.Tensor,
     match_metric: str = "IOU",
@@ -309,10 +363,7 @@ def batched_nmm(
         curr_indices = torch.where(category_ids == category_id)[0]
         curr_keep_to_merge_list = nmm(object_predictions_as_tensor[curr_indices], match_metric, match_threshold)
         curr_indices_list = curr_indices.tolist()
-        for curr_keep, curr_merge_list in curr_keep_to_merge_list.items():
-            keep = curr_indices_list[curr_keep]
-            merge_list = [curr_indices_list[curr_merge_ind] for curr_merge_ind in curr_merge_list]
-            keep_to_merge_list[keep] = merge_list
+        keep_to_merge_list.update(_remap_indices(curr_keep_to_merge_list, curr_indices_list))
     return keep_to_merge_list
 
 
@@ -417,30 +468,113 @@ def nmm(
             if metric >= match_threshold:
                 matched_box_indices.append(candidate_idx)
 
-        # Convert current_idx to native Python int
+        # Update merge mappings using helper function
         current_idx_native = int(current_idx)
+        _update_merge_mappings(current_idx_native, matched_box_indices, keep_to_merge_list, merge_to_keep)
 
-        # Create keep_ind to merge_ind_list mapping
-        if current_idx_native not in merge_to_keep:
-            keep_to_merge_list[current_idx_native] = []
+    return keep_to_merge_list
 
-            for matched_box_idx in matched_box_indices:
-                matched_box_idx_native = int(matched_box_idx)
-                if matched_box_idx_native not in merge_to_keep:
-                    keep_to_merge_list[current_idx_native].append(matched_box_idx_native)
-                    merge_to_keep[matched_box_idx_native] = current_idx_native
-        else:
-            keep_idx = merge_to_keep[current_idx_native]
-            for matched_box_idx in matched_box_indices:
-                matched_box_idx_native = int(matched_box_idx)
-                if (
-                    matched_box_idx_native not in keep_to_merge_list.get(keep_idx, [])
-                    and matched_box_idx_native not in merge_to_keep
-                ):
-                    if keep_idx not in keep_to_merge_list:
-                        keep_to_merge_list[keep_idx] = []
-                    keep_to_merge_list[keep_idx].append(matched_box_idx_native)
-                    merge_to_keep[matched_box_idx_native] = keep_idx
+
+def mask_nmm(
+    object_predictions: list[ObjectPrediction],
+    match_metric: str = "IOU",
+    match_threshold: float = 0.5,
+):
+    """Apply non-maximum merging to mask predictions using polygon geometries.
+
+    Args:
+        object_predictions: List of ObjectPrediction instances with mask/polygon data.
+        match_metric: (str) IOU or IOS
+        match_threshold: (float) The overlap thresh for match metric.
+    Returns:
+        keep_to_merge_list: (Dict[int:List[int]]) mapping from prediction indices
+        to keep to a list of prediction indices to be merged.
+    """
+    scores = [obj_pred.score.value for obj_pred in object_predictions]
+    shapely_annotations = [obj_pred.to_shapely_annotation() for obj_pred in object_predictions]
+    multipolygons = [ann.multipolygon for ann in shapely_annotations]
+    areas = [ann.area for ann in shapely_annotations]
+
+    # Sort indices by score (descending)
+    sorted_idxs = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
+
+    # Build STRtree for efficient spatial queries
+    tree = STRtree(multipolygons)
+
+    keep_to_merge_list = {}
+    merge_to_keep = {}
+
+    for current_idx in sorted_idxs:
+        current_multipolygon = multipolygons[current_idx]
+        current_area = areas[current_idx]
+        current_score = scores[current_idx]
+
+        # Query potential intersections using STRtree
+        candidate_idxs = tree.query(current_multipolygon)
+
+        matched_box_indices = []
+        for candidate_idx in candidate_idxs:
+            if candidate_idx == current_idx:
+                continue
+
+            # Only consider candidates with lower or equal score
+            if scores[candidate_idx] > current_score:
+                continue
+
+            # For equal scores, use deterministic tie-breaking based on index
+            if scores[candidate_idx] == current_score:
+                if candidate_idx > current_idx:
+                    continue
+
+            # Calculate intersection area
+            candidate_multipolygon = multipolygons[candidate_idx]
+            intersection = current_multipolygon.intersection(candidate_multipolygon).area
+
+            # Calculate metric
+            if match_metric == "IOU":
+                union = current_area + areas[candidate_idx] - intersection
+                metric = intersection / union if union > 0 else 0
+            elif match_metric == "IOS":
+                smaller = min(current_area, areas[candidate_idx])
+                metric = intersection / smaller if smaller > 0 else 0
+            elif match_metric == "IAREA":
+                metric = intersection
+            else:
+                raise ValueError("Invalid match_metric")
+
+            # Add to matched list if overlap exceeds threshold
+            if metric >= match_threshold:
+                matched_box_indices.append(candidate_idx)
+
+        # Update merge mappings using helper function
+        _update_merge_mappings(current_idx, matched_box_indices, keep_to_merge_list, merge_to_keep)
+
+    return keep_to_merge_list
+
+
+def batched_mask_nmm(
+    object_predictions: list[ObjectPrediction],
+    match_metric: str = "IOU",
+    match_threshold: float = 0.5,
+):
+    """Apply non-maximum merging per category for mask predictions.
+
+    Args:
+        object_predictions: List of ObjectPrediction instances with mask/polygon data.
+        match_metric: (str) IOU or IOS
+        match_threshold: (float) The overlap thresh for match metric.
+    Returns:
+        keep_to_merge_list: (Dict[int:List[int]]) mapping from prediction indices
+        to keep to a list of prediction indices to be merged.
+    """
+    category_ids = [pred.category.id for pred in object_predictions]
+    keep_to_merge_list = {}
+
+    for category_id in set(category_ids):
+        curr_indices = [i for i, cat_id in enumerate(category_ids) if cat_id == category_id]
+        curr_predictions = [object_predictions[i] for i in curr_indices]
+        curr_keep_to_merge_list = mask_nmm(curr_predictions, match_metric, match_threshold)
+        keep_to_merge_list.update(_remap_indices(curr_keep_to_merge_list, curr_indices))
 
     return keep_to_merge_list
 
@@ -593,5 +727,77 @@ class LSNMSPostprocess(PostprocessPredictions):
         selected_object_predictions = object_prediction_list[keep].tolist()
         if not isinstance(selected_object_predictions, list):
             selected_object_predictions = [selected_object_predictions]
+
+        return selected_object_predictions
+
+
+class MaskNMMPostprocess(PostprocessPredictions):
+    @staticmethod
+    def mask_match(
+        pred1: ObjectPrediction, pred2: ObjectPrediction, match_metric: str, match_threshold: float,
+    ) -> bool:
+        """Check if two mask predictions match using polygon geometry.
+
+        Args:
+            pred1: First ObjectPrediction with mask/polygon data
+            pred2: Second ObjectPrediction with mask/polygon data
+            match_metric: (str) IOU, IOS, or IAREA (intersection area)
+            match_threshold: (float) The overlap threshold for match metric
+
+        Returns:
+            bool: True if predictions match according to metric and threshold
+        """
+        ann1 = pred1.to_shapely_annotation()
+        ann2 = pred2.to_shapely_annotation()
+
+        poly1 = ann1.multipolygon
+        poly2 = ann2.multipolygon
+
+        intersection = poly1.intersection(poly2).area
+
+        if match_metric == "IOU":
+            union = ann1.area + ann2.area - intersection
+            metric = intersection / union if union > 0 else 0
+        elif match_metric == "IOS":
+            smaller = min(ann1.area, ann2.area)
+            metric = intersection / smaller if smaller > 0 else 0
+        elif match_metric == "IAREA":
+            metric = intersection
+        else:
+            raise ValueError(f"Invalid match_metric: {match_metric}")
+
+        return metric >= match_threshold
+
+    def __call__(
+        self,
+        object_predictions: list[ObjectPrediction],
+    ):
+        if self.class_agnostic:
+            keep_to_merge_list = mask_nmm(
+                object_predictions,
+                match_threshold=self.match_threshold,
+                match_metric=self.match_metric,
+            )
+        else:
+            keep_to_merge_list = batched_mask_nmm(
+                object_predictions,
+                match_threshold=self.match_threshold,
+                match_metric=self.match_metric,
+            )
+
+        selected_object_predictions = []
+        for keep_ind, merge_ind_list in keep_to_merge_list.items():
+            for merge_ind in merge_ind_list:
+                # defensive check
+                if self.mask_match(
+                    object_predictions[keep_ind],
+                    object_predictions[merge_ind],
+                    self.match_metric,
+                    self.match_threshold,
+                ):
+                    object_predictions[keep_ind] = merge_object_prediction_pair(
+                        object_predictions[keep_ind], object_predictions[merge_ind]
+                    )
+            selected_object_predictions.append(object_predictions[keep_ind])
 
         return selected_object_predictions

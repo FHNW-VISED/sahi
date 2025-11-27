@@ -15,6 +15,7 @@ from sahi.models.base import DetectionModel
 from sahi.postprocess.combine import (
     GreedyNMMPostprocess,
     LSNMSPostprocess,
+    MaskNMMPostprocess,
     NMMPostprocess,
     NMSPostprocess,
     PostprocessPredictions,
@@ -39,6 +40,7 @@ POSTPROCESS_NAME_TO_CLASS = {
     "NMM": NMMPostprocess,
     "NMS": NMSPostprocess,
     "LSNMS": LSNMSPostprocess,
+    "MASKNMM": MaskNMMPostprocess,
 }
 
 LOW_MODEL_CONFIDENCE = 0.1
