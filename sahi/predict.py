@@ -149,6 +149,7 @@ def get_sliced_prediction(
     postprocess_match_metric: str = "IOS",
     postprocess_match_threshold: float = 0.5,
     postprocess_class_agnostic: bool = False,
+    postprocess_kwargs: dict | None = None,
     verbose: int = 1,
     merge_buffer_length: int | None = None,
     auto_slice_resolution: bool = True,
@@ -191,6 +192,9 @@ def get_sliced_prediction(
             postprocessed after sliced prediction.
         postprocess_class_agnostic: bool
             If True, postprocess will ignore category ids.
+        postprocess_kwargs: dict, optional
+            Additional keyword arguments to pass to the postprocess constructor.
+            For example, for MaskNMM: {'use_largest_polygon': True}
         verbose: int
             0: no print
             1: print number of slices (default)
@@ -257,10 +261,12 @@ def get_sliced_prediction(
             f"but given as {postprocess_type}"
         )
     postprocess_constructor = POSTPROCESS_NAME_TO_CLASS[postprocess_type]
+    postprocess_kwargs = postprocess_kwargs or {}
     postprocess = postprocess_constructor(
         match_threshold=postprocess_match_threshold,
         match_metric=postprocess_match_metric,
         class_agnostic=postprocess_class_agnostic,
+        **postprocess_kwargs,
     )
 
     postprocess_time = 0

@@ -107,17 +107,11 @@ class ShapelyAnnotation:
 
     @property
     def area(self):
-        return int(self.__area)
+        return int(self.__multipolygon.area)
 
     @multipolygon.setter
     def multipolygon(self, multipolygon: MultiPolygon):
         self.__multipolygon = multipolygon
-        # calculate areas of all polygons
-        area = 0
-        for shapely_polygon in multipolygon.geoms:
-            area += shapely_polygon.area
-        # set instance area
-        self.__area = area
 
     def to_list(self):
         """

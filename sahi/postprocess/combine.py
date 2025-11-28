@@ -475,10 +475,58 @@ def nmm(
     return keep_to_merge_list
 
 
+def _mask_match(
+    multipolygon1,
+    multipolygon2,
+    match_metric: str,
+    match_threshold: float,
+    use_largest_polygon_only: bool = False,
+) -> bool:
+    """Check if two mask geometries match using polygon overlap.
+
+    Args:
+        multipolygon1: First shapely multipolygon geometry
+        multipolygon2: Second shapely multipolygon geometry
+        match_metric: (str) IOU, IOS, or IAREA (intersection area)
+        match_threshold: (float) The overlap threshold for match metric
+        use_largest_polygon_only: (bool) If True, only use the largest polygon from each multipolygon for matching
+
+    Returns:
+        bool: True if geometries match according to metric and threshold
+    """
+    # Extract largest polygons if requested
+    if use_largest_polygon_only:
+        poly1 = max(multipolygon1.geoms, key=lambda p: p.area) if multipolygon1.geoms else multipolygon1
+        poly2 = max(multipolygon2.geoms, key=lambda p: p.area) if multipolygon2.geoms else multipolygon2
+    else:
+        poly1 = multipolygon1
+        poly2 = multipolygon2
+
+    intersection = poly1.intersection(poly2).area
+
+    if match_metric == "IOU":
+        area1 = poly1.area
+        area2 = poly2.area
+        union = area1 + area2 - intersection
+        metric = intersection / union if union > 0 else 0
+    elif match_metric == "IOS":
+        area1 = poly1.area
+        area2 = poly2.area
+        smaller = min(area1, area2)
+        metric = intersection / smaller if smaller > 0 else 0
+    elif match_metric == "IAREA":
+        metric = intersection
+    else:
+        raise ValueError(f"Invalid match_metric: {match_metric}")
+
+    return metric >= match_threshold
+
+
 def mask_nmm(
     object_predictions: list[ObjectPrediction],
     match_metric: str = "IOU",
     match_threshold: float = 0.5,
+    use_largest_polygon_only: bool = False,
 ):
     """Apply non-maximum merging to mask predictions using polygon geometries.
 
@@ -486,6 +534,7 @@ def mask_nmm(
         object_predictions: List of ObjectPrediction instances with mask/polygon data.
         match_metric: (str) IOU or IOS
         match_threshold: (float) The overlap thresh for match metric.
+        use_largest_polygon_only: (bool) If True, only use the largest polygon from each multipolygon for matching.
     Returns:
         keep_to_merge_list: (Dict[int:List[int]]) mapping from prediction indices
         to keep to a list of prediction indices to be merged.
@@ -493,7 +542,6 @@ def mask_nmm(
     scores = [obj_pred.score.value for obj_pred in object_predictions]
     shapely_annotations = [obj_pred.to_shapely_annotation() for obj_pred in object_predictions]
     multipolygons = [ann.multipolygon for ann in shapely_annotations]
-    areas = [ann.area for ann in shapely_annotations]
 
     # Sort indices by score (descending)
     sorted_idxs = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
@@ -506,7 +554,6 @@ def mask_nmm(
 
     for current_idx in sorted_idxs:
         current_multipolygon = multipolygons[current_idx]
-        current_area = areas[current_idx]
         current_score = scores[current_idx]
 
         # Query potential intersections using STRtree
@@ -526,24 +573,14 @@ def mask_nmm(
                 if candidate_idx > current_idx:
                     continue
 
-            # Calculate intersection area
-            candidate_multipolygon = multipolygons[candidate_idx]
-            intersection = current_multipolygon.intersection(candidate_multipolygon).area
-
-            # Calculate metric
-            if match_metric == "IOU":
-                union = current_area + areas[candidate_idx] - intersection
-                metric = intersection / union if union > 0 else 0
-            elif match_metric == "IOS":
-                smaller = min(current_area, areas[candidate_idx])
-                metric = intersection / smaller if smaller > 0 else 0
-            elif match_metric == "IAREA":
-                metric = intersection
-            else:
-                raise ValueError("Invalid match_metric")
-
-            # Add to matched list if overlap exceeds threshold
-            if metric >= match_threshold:
+            # Check if masks match using helper function
+            if _mask_match(
+                current_multipolygon,
+                multipolygons[candidate_idx],
+                match_metric,
+                match_threshold,
+                use_largest_polygon_only,
+            ):
                 matched_box_indices.append(candidate_idx)
 
         # Update merge mappings using helper function
@@ -556,6 +593,7 @@ def batched_mask_nmm(
     object_predictions: list[ObjectPrediction],
     match_metric: str = "IOU",
     match_threshold: float = 0.5,
+    use_largest_polygon_only: bool = False,
 ):
     """Apply non-maximum merging per category for mask predictions.
 
@@ -563,6 +601,7 @@ def batched_mask_nmm(
         object_predictions: List of ObjectPrediction instances with mask/polygon data.
         match_metric: (str) IOU or IOS
         match_threshold: (float) The overlap thresh for match metric.
+        use_largest_polygon_only: (bool) If True, only use the largest polygon from each multipolygon for matching.
     Returns:
         keep_to_merge_list: (Dict[int:List[int]]) mapping from prediction indices
         to keep to a list of prediction indices to be merged.
@@ -573,7 +612,7 @@ def batched_mask_nmm(
     for category_id in set(category_ids):
         curr_indices = [i for i, cat_id in enumerate(category_ids) if cat_id == category_id]
         curr_predictions = [object_predictions[i] for i in curr_indices]
-        curr_keep_to_merge_list = mask_nmm(curr_predictions, match_metric, match_threshold)
+        curr_keep_to_merge_list = mask_nmm(curr_predictions, match_metric, match_threshold, use_largest_polygon_only)
         keep_to_merge_list.update(_remap_indices(curr_keep_to_merge_list, curr_indices))
 
     return keep_to_merge_list
@@ -732,41 +771,15 @@ class LSNMSPostprocess(PostprocessPredictions):
 
 
 class MaskNMMPostprocess(PostprocessPredictions):
-    @staticmethod
-    def mask_match(
-        pred1: ObjectPrediction, pred2: ObjectPrediction, match_metric: str, match_threshold: float,
-    ) -> bool:
-        """Check if two mask predictions match using polygon geometry.
-
-        Args:
-            pred1: First ObjectPrediction with mask/polygon data
-            pred2: Second ObjectPrediction with mask/polygon data
-            match_metric: (str) IOU, IOS, or IAREA (intersection area)
-            match_threshold: (float) The overlap threshold for match metric
-
-        Returns:
-            bool: True if predictions match according to metric and threshold
-        """
-        ann1 = pred1.to_shapely_annotation()
-        ann2 = pred2.to_shapely_annotation()
-
-        poly1 = ann1.multipolygon
-        poly2 = ann2.multipolygon
-
-        intersection = poly1.intersection(poly2).area
-
-        if match_metric == "IOU":
-            union = ann1.area + ann2.area - intersection
-            metric = intersection / union if union > 0 else 0
-        elif match_metric == "IOS":
-            smaller = min(ann1.area, ann2.area)
-            metric = intersection / smaller if smaller > 0 else 0
-        elif match_metric == "IAREA":
-            metric = intersection
-        else:
-            raise ValueError(f"Invalid match_metric: {match_metric}")
-
-        return metric >= match_threshold
+    def __init__(
+        self,
+        match_threshold: float = 0.5,
+        match_metric: str = "IOU",
+        class_agnostic: bool = True,
+        use_largest_polygon_only: bool = False,
+    ):
+        super().__init__(match_threshold, match_metric, class_agnostic)
+        self.use_largest_polygon_only = use_largest_polygon_only
 
     def __call__(
         self,
@@ -777,23 +790,28 @@ class MaskNMMPostprocess(PostprocessPredictions):
                 object_predictions,
                 match_threshold=self.match_threshold,
                 match_metric=self.match_metric,
+                use_largest_polygon_only=self.use_largest_polygon_only,
             )
         else:
             keep_to_merge_list = batched_mask_nmm(
                 object_predictions,
                 match_threshold=self.match_threshold,
                 match_metric=self.match_metric,
+                use_largest_polygon_only=self.use_largest_polygon_only,
             )
 
         selected_object_predictions = []
         for keep_ind, merge_ind_list in keep_to_merge_list.items():
             for merge_ind in merge_ind_list:
                 # defensive check
-                if self.mask_match(
-                    object_predictions[keep_ind],
-                    object_predictions[merge_ind],
+                ann_keep = object_predictions[keep_ind].to_shapely_annotation()
+                ann_merge = object_predictions[merge_ind].to_shapely_annotation()
+                if _mask_match(
+                    ann_keep.multipolygon,
+                    ann_merge.multipolygon,
                     self.match_metric,
                     self.match_threshold,
+                    self.use_largest_polygon_only,
                 ):
                     object_predictions[keep_ind] = merge_object_prediction_pair(
                         object_predictions[keep_ind], object_predictions[merge_ind]
